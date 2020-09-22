@@ -4,111 +4,144 @@
 
 package envy
 
-import cats.data._
 import cats._
+import cats.data._
 import cats.implicits._
 
 sealed trait Trace {
   import Trace._
 
-  def failed: Boolean = incomplete || error.isDefined
+  def title:      String
+  def incomplete: Boolean      = false
+  def errors:     List[String] = Nil
 
-  /** True if the configuration is incomplete due to missing keys. */
-  def incomplete: Boolean   = false
+  final def error:    Boolean = errors.nonEmpty
+  final def complete: Boolean = !incomplete
 
-  def error: Option[String] = None // Chain[String]
+  def &&(that: Trace): Trace =
+    (this, that) match {
 
-  /** Product of traces; this and that. */
-  def &&(that: Trace): Trace = Conj(this, that)
+      // pure gets absorbed
+      case (a, Pure) => a
+      case (Pure, a) => a
 
-  /** Coproduct of traces; this or that. */
-  def ||(that: Trace): Trace = Disj(this, that)
+      // conj gets joined
+      case (Conjunction(a), Conjunction(b)) => Conjunction(a :++ b.filterNot(a.contains))
+      case (Conjunction(a), b)              => Conjunction(a) && Conjunction(b)
+      case (a, Conjunction(b))              => Conjunction(a) && Conjunction(b)
 
-  def icons: String =
-    if (error.isDefined) "[!]"
-    else if (incomplete) "[ ]"
-    else "[x]"
+      // Otherwise, new conjunction
+      case (a, b) => Conjunction(a, b)
 
-  def describe(indent: String): String =
-    s"$indent$icons $describeImpl"
+    }
 
-  def describeImpl: String
+  def ||(that: Trace): Trace =
+    (this, that) match {
+
+      // pure gets absorbed
+      case (a, Pure) => a
+      case (Pure, a) => a
+
+      // disj gets joined
+      case (Disjunction(a), Disjunction(b)) => Disjunction(a :++ b.filterNot(a.contains))
+      case (Disjunction(a), b)              => Disjunction(a) || Disjunction(b)
+      case (a, Disjunction(b))              => Disjunction(a) || Disjunction(b)
+
+      // Otherwise, new disjunction
+      case (a, b) => Disjunction(a, b)
+
+    }
+
+  def icon: String =
+         if (this == Trace.Halt) "[-]" // special case
+    else if (errors.nonEmpty)    "[!]" // error
+    else if (incomplete)         "[ ]" // incomplete
+    else                         "[+]" // all good!
+
+  def toTree(indent: Int): String =
+    s"${" " * (indent * 4)}$icon $title"
+
+  override def toString(): String =
+    toTree(0)
 
   def dump(): Unit =
-    println(describe(""))
+    println(toString())
 
-}
+  def toException: Exception =
+    new Exception(toString()) // TODO
 
-trait CompositeTrace extends Trace {
-  def elems: NonEmptyChain[Trace]
-  override def error: Option[String] = elems.map(_.error).collectFirst { case Some(s) => s }
-  override def describe(indent: String) = s"$indent$icons $describeImpl\n${elems.map(_.describe(indent + "    ")).intercalate("\n")}"
 }
 
 object Trace {
 
+  implicit lazy val EqTrace: Eq[Trace] = Eq.fromUniversalEquals
+
+  /** A trace that aggregates one or more prior traces. */
+  sealed abstract class CompositeTrace(elements: NonEmptyChain[Trace]) extends Trace {
+    override def incomplete = elements.exists(_.incomplete)
+    override def errors     = elements.foldMap(_.errors)
+    override def toTree(indent: Int): String =
+      (super.toTree(indent) +: elements.map(_.toTree(indent + 1))).intercalate("\n")
+  }
+
+  /**
+   * A trace indicating a pure value was yielded. These proliferate via appliciative combinators
+   * but they are uninteresting and we eliminate them in conjunctions and disjunctions.
+   */
   case object Pure extends Trace {
-    def describeImpl = s"<pure>"
+    def title = "<pure>"
   }
 
+  /** A trace indicating that a flatMap could not be performed due to prior failure. */
   case object Halt extends Trace {
-    override def icons: String = "[-]"
-    def describeImpl: String = "<sequential execution halted>"
+    def title = "<halt>"
   }
 
-  case class Success(key: Key) extends Trace {
-    def describeImpl: String = s"${key.name}${key.description.foldMap(d => s": $d")}"
-  }
-  case class Missing(key: Key) extends Trace {
-    override def incomplete: Boolean = true
-    def describeImpl: String = s"${key.name}${key.description.foldMap(d => s": $d")}"
-  }
-  case class Failure(key: Option[Key], prior: Option[Trace], message: String) extends Trace {
-    override def error: Option[String] = Some(message)
-    override def incomplete: Boolean = prior.exists(_.incomplete)
-    def describeImpl: String = s"${key.foldMap(key => s"${key.name}: ")}$message"
-  }
-  case class Optional(trace: Trace, provided: Boolean) extends CompositeTrace {
-    override def error: Option[String] = trace.error
-    def status = if (error.isDefined) "" else s" (${if (provided) "provided" else "not provided"})"
-    def describeImpl: String = s"optional$status"
-    def elems: NonEmptyChain[Trace] = NonEmptyChain(trace)
+  /** A trace indicating an error was raised. */
+  case class Error(message: String) extends Trace {
+    def title  = message
+    override def errors = List(message)
   }
 
-  case class Conj(elems: NonEmptyChain[Trace]) extends CompositeTrace {
-    override def incomplete: Boolean = elems.exists(_.incomplete)
-    def describeImpl: String = "all of the following"
-    override def &&(other: Trace): Trace =
-      other match {
-        case Conj(b) => Conj(elems :++ b.filterNot(elems.contains))
-        case b       => this && Conj(b)
-      }
-  }
-  object Conj {
-    def apply(a: Trace, as: Trace*): Conj =
-      Conj(NonEmptyChain(a, as: _*))
+  /** A trace indicating that validation failed on a prior configuration. */
+  case class Invalid(message: String, child: Trace) extends CompositeTrace(NonEmptyChain(child)) {
+    def title = message
+    override def errors = message :: super.errors
   }
 
-  case class Disj(elems: NonEmptyChain[Trace]) extends CompositeTrace {
-    override def error: Option[String] = elems.map(_.error).collectFirst { case Some(s) => s }
-    override def incomplete: Boolean = elems.forall(_.incomplete)
-    def describeImpl: String = "one of the following"
-    override def ||(other: Trace): Trace =
-      other match {
-        case Disj(b) => Disj(elems :++ b.filterNot(elems.contains))
-        case b       => this || Disj(b)
-      }
-  }
-  object Disj {
-    def apply(a: Trace, as: Trace*): Disj =
-      Disj(NonEmptyChain(a, as: _*))
+  /** A trace indicating that a prior configuration is optional (and can never be incomplete). */
+  case class Optional(child: Trace, provided: Boolean) extends CompositeTrace(NonEmptyChain(child)) {
+    def title = "optional"
+    override def incomplete = false
+    override def errors = title :: child.errors
   }
 
-  implicit val EqTrace: Eq[Trace] =
-    Eq.fromUniversalEquals
+  /** A trace indicating that an environment variable was read. */
+  case class Read(key: Key, value: Option[String]) extends Trace {
+    def precis(s: String): String = {
+      val filtered = s.exists(_.isControl)
+      val sʹ  = s.map { c => if (c.isControl) '☐' else c } .take(40)
+      s"$sʹ${if (sʹ.length() < s.length()) "⋯ <truncated>" else ""}${if (filtered) " <filtered>" else ""}"
+    }
+    def title = s"${key.name}${value.map(precis).map(s => if (key.secret) "<redacted>" else s).foldMap(v => s" = $v")}"
+    override def incomplete = value.isEmpty
+  }
+
+  /** A trace indicating that a configuration requires many prior configurations. */
+  case class Conjunction(elements: NonEmptyChain[Trace]) extends CompositeTrace(elements) {
+    def title    = "all of the following"
+  }
+  object Conjunction {
+    def apply(elem: Trace, elems: Trace*): Conjunction = apply(NonEmptyChain(elem, elems: _*))
+  }
+
+  /** A trace indicating that a configuration requires one of many prior configurations. */
+  case class Disjunction(elements: NonEmptyChain[Trace]) extends CompositeTrace(elements) {
+    def title    = "one of the following"
+    override def incomplete = elements.forall(_.incomplete)
+  }
+  object Disjunction {
+    def apply(elem: Trace, elems: Trace*): Disjunction = apply(NonEmptyChain(elem, elems: _*))
+  }
 
 }
-
-
-///
-

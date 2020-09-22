@@ -34,6 +34,7 @@ lazy val commonSettings = Seq(
     "-sourcepath", (baseDirectory in LocalRootProject).value.getAbsolutePath,
     "-doc-source-url", "https://github.com/tpolecat/envy/blob/v" + version.value + "€{FILE_PATH}.scala",
   ),
+  addCompilerPlugin("org.typelevel" %% "kind-projector" % "0.11.0" cross CrossVersion.full),
 
   // Coverage Exclusions
   coverageExcludedPackages := "",

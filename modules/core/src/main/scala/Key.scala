@@ -4,4 +4,8 @@
 
 package envy
 
-case class Key(name: String, description: Option[String])
+case class Key(
+  name: String,
+  description: Option[String] = None,
+  secret: Boolean = false
+)

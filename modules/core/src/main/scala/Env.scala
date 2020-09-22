@@ -5,41 +5,37 @@
 package envy
 
 import cats._
+import cats.data._
 import cats.implicits._
-import cats.effect.Sync
+// import cats.effect.Sync
 
-sealed abstract case class Env[A](run: (String => Option[String]) => (Trace, Option[Key], Option[A])) { outer =>
+sealed abstract case class Env[A](run: (String => Option[String]) => (Trace, Option[A])) { outer =>
 
-  def load[F[_]: Sync]: F[A] =
-    Sync[F].delay(run((sys.env orElse sys.props).lift)).flatMap {
-      case (_, _, Some(a)) => a.pure[F]
-      case (t, _, None)    => Sync[F].raiseError(new RuntimeException(
-        s"""|Configuration failed.
-            |
-            |Configuration has failed due to missing or invalid environment variables and/or system
-            |properties. The configuration specification below indicates what is required, what has
-            |been provided thus far [x] and what is invalid [!]. If the configuration includes
-            |sequential (monadic) composition then some of the configuration may remain unspecified
-            |until sequential execution can continue.
-            |
-            |${t.describe("  ")}
-            |""".stripMargin
-      ))
-    }
-
-  def pureLoad(env: String => Option[String]): (Trace, Option[A]) =
-    run(env) match {
-      case (t, _, a) => (t, a)
-    }
+  // def load[F[_]: Sync]: F[A] =
+  //   Sync[F].delay(run((sys.env orElse sys.props).lift)).flatMap {
+  //     case (_, _, Some(a)) => a.pure[F]
+  //     case (t, _, None)    => Sync[F].raiseError(new RuntimeException(
+  //       s"""|Configuration failed.
+  //           |
+  //           |Configuration has failed due to missing or invalid environment variables and/or system
+  //           |properties. The configuration specification below indicates what is required, what has
+  //           |been provided thus far [x] and what is invalid [!]. If the configuration includes
+  //           |sequential (monadic) composition then some of the configuration may remain unspecified
+  //           |until sequential execution can continue.
+  //           |
+  //           |${t.describe("  ")}
+  //           |""".stripMargin
+  //     ))
+  //   }
 
   def emap[B](f: A => Either[String, B]): Env[B] =
     Env { env =>
       run(env) match {
-        case (t, k, None) => (t, k, None)
-        case (t, k, Some(a)) =>
+        case (t, None)    => (t, None)
+        case (t, Some(a)) =>
           f(a) match {
-            case Left(msg) => (Trace.Failure(k, Some(t), msg), k, None)
-            case Right(b)  => (t, k, Some(b))
+            case Left(msg) => (Trace.Invalid(msg, t), None)
+            case Right(b)  => (t, Some(b))
           }
       }
     }
@@ -49,9 +45,8 @@ sealed abstract case class Env[A](run: (String => Option[String]) => (Trace, Opt
 
   def optional: Env[Option[A]] =
     Env { env =>
-      run(env) match {
-        case (t, k, op) => (Trace.Optional(t, op.isDefined), k, Some(op).filter(_ => t.error.isDefined))
-      }
+      val (t, op) = run(env)
+      (Trace.Optional(t, op.isDefined), Some(op).filter(_ => t.errors.nonEmpty))
     }
 
   def to[B](implicit ev: EMapper[A, B]): Env[B] =
@@ -64,11 +59,11 @@ sealed abstract case class Env[A](run: (String => Option[String]) => (Trace, Opt
   def or(that: Env[A]): Env[A] =
     this <+> that
 
-  def default(value: A): Env[A] =
-    Env { env =>
-      val (t, k, a) = outer.run(env)
-      if (t.error.isDefined) (t, k, a) else (t, k, a orElse Some(value))
-    }
+  // def default(value: A): Env[A] =
+  //   Env { env =>
+  //     val (t, k, a) = outer.run(env)
+  //     if (t.error.isDefined) (t, k, a) else (t, k, a orElse Some(value))
+  //   }
 
   def redacted = this
 
@@ -76,43 +71,45 @@ sealed abstract case class Env[A](run: (String => Option[String]) => (Trace, Opt
 
 object Env {
 
-  private[envy] def apply[A](run: (String => Option[String]) => (Trace, Option[Key], Option[A])) =
+  private[envy] def apply[A](run: (String => Option[String]) => (Trace, Option[A])) =
     new Env[A](run) {}
 
-  implicit val MonadErrorEnv: MonadError[Env, String] with SemigroupK[Env] =
-    new MonadError[Env, String] with SemigroupK[Env] {
+  implicit val MonadErrorEnv: MonadError[Env, NonEmptyChain[String]] with SemigroupK[Env] =
+    new MonadError[Env, NonEmptyChain[String]] with SemigroupK[Env] {
 
       def pure[A](a: A): Env[A] =
-        Env(_ => (Trace.Pure, None, Some(a)))
+        Env(_ => (Trace.Pure, Some(a)))
 
-      def raiseError[A](error: String): Env[A] =
-        Env(_ => (Trace.Failure(None, None, error), None, None))
+      def raiseError[A](messages: NonEmptyChain[String]): Env[A] =
+        Env { _ =>
+          (messages.map[Trace](Trace.Error(_)).reduceLeft(_ && _), None)
+        }
 
-      def handleErrorWith[A](fa: Env[A])(f: String => Env[A]): Env[A] =
+      def handleErrorWith[A](fa: Env[A])(f:  NonEmptyChain[String] => Env[A]): Env[A] =
         Env { env =>
-          val (t, k, a) = fa.run(env)
-          t.error match {
-            case None => (t, k, a)
-            case Some(e) =>
-              val (tʹ, kʹ, aʹ) = f(e).run(env)
-              (t && tʹ, kʹ <+> k, aʹ)
+          fa.run(env) match {
+            case (t, Some(a)) => (t, Some(a))
+            case (t, None) =>
+              NonEmptyChain.fromSeq(t.errors) match {
+                case Some(nec) => f(nec).run(env) // TODO: how do we not discard the prior trace? we need an "error handled" trace or something?
+                case None      => (t, None)       // incomplete but no errors
+              }
           }
         }
 
       override def map[A, B](fa: Env[A])(f: A => B): Env[B] =
         Env { env =>
-          fa.run(env) match {
-            case (t, k, a) => (t, k, a.map(f))
-          }
+          val (t, a) = fa.run(env)
+          (t, a.map(f))
         }
 
       def flatMap[A, B](fa: Env[A])(f: A => Env[B]): Env[B] =
         Env { env =>
           fa.run(env) match {
-            case (t, k, None)    => (t && Trace.Halt, k, None)
-            case (t, k, Some(a)) =>
+            case (t, None)    => (t && Trace.Halt, None)
+            case (t, Some(a)) =>
               f(a).run(env) match {
-                case (tʹ, kʹ, b) => (t && tʹ, kʹ <+> k, b)
+                case (tʹ, b) => (t && tʹ, b)
               }
           }
         }
@@ -120,37 +117,64 @@ object Env {
       def tailRecM[A, B](a: A)(f: A => Env[Either[A,B]]): Env[B] =
         Env { env =>
 
-          def go(t: Trace, k: Option[Key], op: Option[Either[A, B]]): (Trace, Option[Key], Option[B]) =
+          def go(t: Trace, op: Option[Either[A, B]]): (Trace, Option[B]) =
             op match {
-              case None           => (t && Trace.Halt, k, None)
-              case Some(Right(b)) => (t, k, Some(b))
+              case None           => (t && Trace.Halt, None)
+              case Some(Right(b)) => (t, Some(b))
               case Some(Left(a))  =>
-                val (tʹ, kʹ, op) = f(a).run(env)
-                go(t && tʹ, kʹ <+> k, op)
+                val (tʹ, op) = f(a).run(env)
+                go(t && tʹ, op)
             }
 
-          val (t, k, op) = f(a).run(env)
-          go(t, k, op)
+          val (t, op) = f(a).run(env)
+          go(t, op)
 
         }
 
       def combineK[A](x: Env[A], y: Env[A]): Env[A] =
         Env { env =>
-          val (tx, _, ax) = x.run(env)
-          val (ty, _, ay) = y.run(env)
-          (tx || ty, None, ax <+> ay)
+          val (tx, ax) = x.run(env)
+          val (ty, ay) = y.run(env)
+          (tx || ty, ax <+> ay)
         }
 
     }
 
   implicit val ParallelEnv: Parallel[Env] =
     new Parallel[Env] {
-      type F[A] = ParEnv[A]
-      val sequential  = new (ParEnv ~> Env) { def apply[A](fa: ParEnv[A]) = Env(fa.run) }
-      val parallel    = new (Env ~> ParEnv) { def apply[A](fa: Env[A]) = ParEnv(fa.run) }
-      val applicative = ParEnv.ApplicativeParEnv
+      type F[A] = Par[A]
+      val sequential  = new (Par ~> Env) { def apply[A](fa: Par[A]) = Env(fa.run) }
+      val parallel    = new (Env ~> Par) { def apply[A](fa: Env[A]) = Par(fa.run) }
+      val applicative = Par.ApplicativeParEnv
       val monad       = Env.MonadErrorEnv
    }
+
+
+  sealed abstract case class Par[A](
+    run: (String => Option[String]) => (Trace, Option[A])
+  )
+
+  object Par {
+
+    private[envy] def apply[A](run: (String => Option[String]) => (Trace, Option[A])) =
+      new Par[A](run) {}
+
+    implicit val ApplicativeParEnv: Applicative[Par] =
+      new Applicative[Par] {
+
+        def pure[A](a: A): Par[A] =
+          Par(_ => (Trace.Pure, Some(a)))
+
+        def ap[A, B](fab: Par[A => B])(fa: Par[A]): Par[B] =
+          Par { env =>
+            val (t1, f) = fab.run(env)
+            val (t2, a) = fa.run(env)
+            (t1 && t2, f ap a)
+          }
+      }
+
+  }
+
 
 }
 
